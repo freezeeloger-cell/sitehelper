@@ -271,6 +271,34 @@ ${article.excerpt}
 Публикую? 👇`;
 }
 
+// Build the full readable article text from blocks
+function renderFullText(article) {
+  let out = `📰 ${article.h1}\n\n`;
+  for (const b of (article.blocks || [])) {
+    const text = (b.text || '').replace(/\*\*(.+?)\*\*/g, '$1');
+    if (b.type === 'h2') out += `\n━━━ ${text} ━━━\n`;
+    else if (b.type === 'h3') out += `\n▸ ${text}\n`;
+    else out += `${text}\n`;
+  }
+  return out.trim();
+}
+
+// Telegram caps messages at ~4096 chars — split safely on paragraph breaks
+function splitMessage(text, limit = 3800) {
+  const parts = [];
+  let current = '';
+  for (const line of text.split('\n')) {
+    if ((current + '\n' + line).length > limit) {
+      if (current) parts.push(current);
+      current = line;
+    } else {
+      current = current ? current + '\n' + line : line;
+    }
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
 // ─── BOT HANDLERS ────────────────────────────────────────────────────────────
 
 bot.start(ctx => {
@@ -418,6 +446,13 @@ async function processAndWrite(ctx, session) {
     session.info.article = article;
 
     await ctx.telegram.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
+
+    // Send the full article text first (split into chunks if long)
+    await ctx.reply('📖 Полный текст статьи — прочитай перед публикацией:');
+    for (const part of splitMessage(renderFullText(article))) {
+      await ctx.reply(part);
+      await sleep(300); // small gap so messages arrive in order
+    }
 
     session.state = 'awaiting_confirm';
     await ctx.reply(formatPreview(article), {
