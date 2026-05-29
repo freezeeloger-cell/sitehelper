@@ -2,17 +2,66 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 const FormData = require('form-data');
+const fs = require('fs');
+const path = require('path');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
-// ─── SESSION (in-memory, можно заменить на Redis) ────────────────────────────
-const sessions = {};
+// ─── PERSISTENT MEMORY (диск, переживает перезапуски) ────────────────────────
+const MEMORY_FILE = process.env.MEMORY_FILE || '/data/memory.json';
+let memory = { sessions: {}, log: [] };
+
+function loadMemory() {
+  try {
+    if (fs.existsSync(MEMORY_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
+      memory.sessions = parsed.sessions || {};
+      memory.log = parsed.log || [];
+      console.log(`🧠 Память загружена: сессий ${Object.keys(memory.sessions).length}, статей в журнале ${memory.log.length}`);
+    } else {
+      console.log('🧠 Файл памяти не найден — начинаю с чистого листа.');
+    }
+  } catch (e) {
+    console.error('🧠 Ошибка загрузки памяти:', e.message);
+  }
+}
+
+let saveTimer = null;
+function saveMemory() {
+  // Лёгкий дебаунс, чтобы не писать на диск слишком часто
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    try {
+      fs.mkdirSync(path.dirname(MEMORY_FILE), { recursive: true });
+      fs.writeFileSync(MEMORY_FILE, JSON.stringify(memory));
+    } catch (e) {
+      console.error('🧠 Ошибка сохранения памяти:', e.message);
+    }
+  }, 400);
+}
+
+// Записать опубликованную статью в журнал (чтобы помнить и не дублировать темы)
+function logPublished(article) {
+  memory.log.unshift({
+    title: article.h1,
+    slug: article.slug,
+    category: article.category || null,
+    keywords: article.keywords || [],
+    publishedAt: new Date().toISOString(),
+  });
+  if (memory.log.length > 500) memory.log.length = 500; // не растём бесконечно
+  saveMemory();
+}
+
+// ─── SESSION (на диске) ──────────────────────────────────────────────────────
+const sessions = memory.sessions;
 function getSession(chatId) {
-  if (!sessions[chatId]) sessions[chatId] = { state: 'idle', photos: [], info: {} };
+  if (!sessions[chatId]) { sessions[chatId] = { state: 'idle', photos: [], info: {} }; saveMemory(); }
   return sessions[chatId];
 }
 function resetSession(chatId) {
   sessions[chatId] = { state: 'idle', photos: [], info: {} };
+  saveMemory();
 }
 
 // ─── PAYLOAD CMS ─────────────────────────────────────────────────────────────
@@ -349,6 +398,14 @@ bot.command('status', ctx => {
   ctx.reply(`Статус: *${s.state}*\nФото: ${s.photos.length}\nРаздел: ${s.info.section?.label || 'не задан'}`, { parse_mode:'Markdown' });
 });
 
+bot.command('log', ctx => {
+  if (!memory.log.length) return ctx.reply('📚 Журнал пуст — ещё ничего не публиковал.');
+  const last = memory.log.slice(0, 15)
+    .map((a, i) => `${i + 1}. ${a.title}\n   /blog/${a.slug}`)
+    .join('\n');
+  ctx.reply(`📚 *Последние статьи (всего ${memory.log.length}):*\n\n${last}`, { parse_mode:'Markdown' });
+});
+
 // ─── PHOTO HANDLER ───────────────────────────────────────────────────────────
 bot.on('photo', async ctx => {
   const session = getSession(ctx.chat.id);
@@ -490,6 +547,7 @@ async function processAndWrite(ctx, session) {
     }
 
     session.state = 'awaiting_confirm';
+    saveMemory(); // статья готова — сохраняем, чтобы перезапуск не сбил
     if (session.photos.length === 0) {
       await ctx.reply('⚠️ К статье не прикреплено фото, а обложка обязательна. Пришли фото сейчас (одним сообщением), потом жми «Публикуй».');
     }
@@ -529,8 +587,9 @@ async function publishArticle(ctx, session) {
     const result = await createPost(token, article, mediaIds);
 
     const url = `${CMS_URL}/blog/${article.slug}`;
+    logPublished(article);
     await ctx.reply(
-      `✅ *Опубликовано!*\n\n*${article.h1}*\n\n🔗 ${url}\n📸 Фото: ${mediaIds.length} загружено`,
+      `✅ *Опубликовано!*\n\n*${article.h1}*\n\n🔗 ${url}\n📸 Фото: ${mediaIds.length} загружено\n\n📚 Всего статей в журнале бота: ${memory.log.length}`,
       { parse_mode:'Markdown' }
     );
 
@@ -546,6 +605,7 @@ async function publishArticle(ctx, session) {
 }
 
 // ─── LAUNCH ──────────────────────────────────────────────────────────────────
+loadMemory();
 bot.launch()
   .then(() => console.log('✅ CrabNorway Bot запущен'))
   .catch(e => console.error('❌ Ошибка запуска:', e));
