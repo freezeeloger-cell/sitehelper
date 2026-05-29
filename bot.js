@@ -488,7 +488,7 @@ bot.hears('❌ Отмена', ctx => {
 async function publishArticle(ctx, session) {
   session.state = 'publishing';
   const article = session.info.article;
-  const msg = await ctx.reply('🚀 Публикую на сайт...', Markup.removeKeyboard());
+  await ctx.reply('🚀 Публикую на сайт...', Markup.removeKeyboard());
 
   try {
     const token = await payloadLogin();
@@ -496,7 +496,7 @@ async function publishArticle(ctx, session) {
     // Upload photos
     const mediaIds = [];
     if (session.photos.length > 0) {
-      await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, '📸 Загружаю фото...');
+      await ctx.reply('📸 Загружаю фото...').catch(() => {});
       for (let i = 0; i < Math.min(session.photos.length, 3); i++) {
         try {
           const buf = await downloadTelegramPhoto(ctx, session.photos[i]);
@@ -506,10 +506,8 @@ async function publishArticle(ctx, session) {
       }
     }
 
-    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, '📝 Создаю статью...');
+    await ctx.reply('📝 Создаю статью...').catch(() => {});
     const result = await createPost(token, article, mediaIds);
-
-    await ctx.telegram.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
 
     const url = `${CMS_URL}/blog/${article.slug}`;
     await ctx.reply(
@@ -520,11 +518,10 @@ async function publishArticle(ctx, session) {
     resetSession(ctx.chat.id);
 
   } catch (e) {
-    await ctx.telegram.deleteMessage(ctx.chat.id, msg.message_id).catch(() => {});
     session.state = 'awaiting_confirm';
     ctx.reply(
-      `❌ Ошибка публикации: *${e.message}*\n\nПроверь настройки CMS в .env файле.\nСтатья сохранена — попробуй ещё раз.`,
-      { parse_mode:'Markdown', ...Markup.keyboard([['✅ Публикуй', '❌ Отмена']]).oneTime().resize() }
+      `❌ Ошибка публикации: ${e.message}\n\nСтатья сохранена — нажми «Публикуй», чтобы попробовать снова.`,
+      Markup.keyboard([['✅ Публикуй', '❌ Отмена']]).oneTime().resize()
     );
   }
 }
