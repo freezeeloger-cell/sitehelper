@@ -91,27 +91,75 @@ function toPayloadLexical(blocks) {
 }
 
 // ─── CLAUDE API ───────────────────────────────────────────────────────────────
-async function callClaude(messages, system, useSearch = false) {
+const MODEL = 'claude-sonnet-4-6';
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function callClaude(messages, system, useSearch = false, maxTokens = 8000) {
   const body = {
-    model: 'claude-sonnet-4-6',
-    max_tokens: 8000,
+    model: MODEL,
+    max_tokens: maxTokens,
     system,
     messages,
   };
   if (useSearch) body.tools = [{ type: 'web_search_20250305', name: 'web_search' }];
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      ...(useSearch ? { 'anthropic-beta': 'web-search-2025-03-05' } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`Claude API error: ${res.status}`);
-  const data = await res.json();
-  return data.content.map(c => c.text || '').join('');
+
+  // Up to 4 attempts with backoff on rate-limit (429) / overloaded (529) / transient (5xx)
+  let lastErr;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try {
+      const res = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': process.env.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01',
+          ...(useSearch ? { 'anthropic-beta': 'web-search-2025-03-05' } : {}),
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (res.status === 429 || res.status === 529 || res.status >= 500) {
+        // Wait and retry: respect Retry-After if present, else exponential backoff
+        const retryAfter = parseInt(res.headers.get('retry-after') || '0', 10);
+        const waitMs = retryAfter > 0 ? retryAfter * 1000 : attempt * 8000;
+        lastErr = new Error(`Claude API error: ${res.status}`);
+        if (attempt < 4) { await sleep(waitMs); continue; }
+        throw lastErr;
+      }
+
+      if (!res.ok) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`Claude API error: ${res.status} ${errText.slice(0, 200)}`);
+      }
+
+      const data = await res.json();
+      return data.content.map(c => c.text || '').join('');
+    } catch (e) {
+      lastErr = e;
+      // Network hiccup — retry a couple times
+      if (attempt < 4 && /fetch|network|ECONN|timeout/i.test(e.message)) {
+        await sleep(attempt * 4000);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
+// Safely extract a JSON object from a model response, tolerating truncation/markdown
+function parseArticleJson(raw) {
+  let s = raw.replace(/```json|```/g, '').trim();
+  // Grab from the first { to the last } in case of stray text
+  const first = s.indexOf('{');
+  const last = s.lastIndexOf('}');
+  if (first !== -1 && last !== -1 && last > first) s = s.slice(first, last + 1);
+  try {
+    return JSON.parse(s);
+  } catch (e) {
+    throw new Error('Модель вернула неполный ответ. Попробуй ещё раз — обычно со второго раза проходит.');
+  }
 }
 
 const SYSTEM = `Ты — контент-агент Даниила Богатько для сайта CrabNorway.com.
@@ -144,7 +192,7 @@ async function getClarifyingQuestions(userText, section) {
 Задай 2-3 уточняющих вопроса если тебе НЕ хватает конкретики для написания качественной статьи.
 Спрашивай только самое важное. Если задача уже достаточно конкретная — верни пустую строку.
 Вопросы короткие, по делу, на русском. Без приветствий. Только вопросы, каждый с новой строки.`;
-  const resp = await callClaude([{ role:'user', content:prompt }], SYSTEM);
+  const resp = await callClaude([{ role:'user', content:prompt }], SYSTEM, false, 500);
   return resp.trim();
 }
 
@@ -161,7 +209,7 @@ async function writeArticle(session) {
   // Research
   const research = await callClaude(
     [{ role:'user', content:`Найди актуальные факты для статьи CrabNorway.com. Контекст:\n${context}\nКонспект фактов, до 300 слов.` }],
-    SYSTEM, true
+    SYSTEM, true, 1500
   );
 
   // Write
@@ -187,8 +235,7 @@ ${context}
 Минимум 12 блоков. Стиль Даниила — личный опыт, цифры, без воды.`
   }], SYSTEM);
 
-  const clean = articleRaw.replace(/```json|```/g,'').trim();
-  const article = JSON.parse(clean);
+  const article = parseArticleJson(articleRaw);
   article.category = info.section?.category || 'blog';
   if (!article.slug) article.slug = slugify(article.h1);
   return article;
