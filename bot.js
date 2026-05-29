@@ -54,13 +54,12 @@ function logPublished(article) {
 }
 
 // ─── SESSION (на диске) ──────────────────────────────────────────────────────
-const sessions = memory.sessions;
 function getSession(chatId) {
-  if (!sessions[chatId]) { sessions[chatId] = { state: 'idle', photos: [], info: {} }; saveMemory(); }
-  return sessions[chatId];
+  if (!memory.sessions[chatId]) { memory.sessions[chatId] = { state: 'idle', photos: [], info: {} }; saveMemory(); }
+  return memory.sessions[chatId];
 }
 function resetSession(chatId) {
-  sessions[chatId] = { state: 'idle', photos: [], info: {} };
+  memory.sessions[chatId] = { state: 'idle', photos: [], info: {} };
   saveMemory();
 }
 
