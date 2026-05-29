@@ -94,7 +94,7 @@ function toPayloadLexical(blocks) {
 async function callClaude(messages, system, useSearch = false) {
   const body = {
     model: 'claude-sonnet-4-6',
-    max_tokens: 1000,
+    max_tokens: 8000,
     system,
     messages,
   };
