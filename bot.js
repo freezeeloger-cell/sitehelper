@@ -347,38 +347,62 @@ bot.on('photo', async ctx => {
   }
 });
 
-// ─── TEXT HANDLER ────────────────────────────────────────────────────────────
+// ─── TEXT HANDLER (единый конечный автомат) ──────────────────────────────────
+const SECTION_BUTTONS = { 'Кейс': 'кейс', 'Блог': 'блог', 'FAQ': 'faq', 'Новость': 'новость' };
+
 bot.on('text', async ctx => {
   const session = getSession(ctx.chat.id);
-  const text = ctx.message.text;
+  const text = ctx.message.text.trim();
 
   if (text.startsWith('/')) return;
 
-  // Waiting for answer to clarifying questions
+  // ── Отмена работает в любом состоянии ──
+  if (text === '❌ Отмена' || text === 'Отмена') {
+    resetSession(ctx.chat.id);
+    return ctx.reply('Отменено. Давай новую задачу.', Markup.removeKeyboard());
+  }
+
+  // ── Ждём подтверждения публикации ──
+  if (session.state === 'awaiting_confirm') {
+    if (text === '✅ Публикуй') {
+      return publishArticle(ctx, session);
+    }
+    if (text === '✏️ Переделай') {
+      session.state = 'redoing';
+      return ctx.reply('Что переделать? Напиши правки одним сообщением.', Markup.removeKeyboard());
+    }
+    // Любой другой текст = дополнительные правки → переписываем
+    session.info.answers = (session.info.answers || '') + '\nДоп. правки: ' + text;
+    return processAndWrite(ctx, session);
+  }
+
+  // ── Собираем правки для переделки ──
+  if (session.state === 'redoing') {
+    session.info.answers = (session.info.answers || '') + '\nПравки: ' + text;
+    return processAndWrite(ctx, session);
+  }
+
+  // ── Ждём выбор раздела (тему НЕ затираем!) ──
+  if (session.state === 'waiting_section') {
+    const key = SECTION_BUTTONS[text];
+    if (!key) {
+      return ctx.reply(
+        'Выбери раздел кнопкой ниже 👇',
+        Markup.keyboard([['Кейс', 'Блог', 'FAQ'], ['Новость', '❌ Отмена']]).oneTime().resize()
+      );
+    }
+    session.info.section = SECTIONS[key];
+    await ctx.reply(`✅ Раздел: ${session.info.section.label}`, Markup.removeKeyboard());
+    return askClarifyOrWrite(ctx, session);
+  }
+
+  // ── Ответы на уточняющие вопросы ──
   if (session.state === 'clarifying') {
     session.info.answers = (session.info.answers || '') + '\n' + text;
-    await processAndWrite(ctx, session);
-    return;
+    return processAndWrite(ctx, session);
   }
 
-  // Confirm publish
-  if (session.state === 'awaiting_confirm') {
-    const lower = text.toLowerCase();
-    if (['да','yes','ок','ok','давай','публикуй','го','publish'].some(w => lower.includes(w))) {
-      await publishArticle(ctx, session);
-    } else if (['нет','no','стоп','отмена','cancel','переделай','ещё раз'].some(w => lower.includes(w))) {
-      resetSession(ctx.chat.id);
-      ctx.reply('Окей, отменено. Давай новую задачу или уточни что переделать.');
-    } else {
-      // Treat as additional instructions
-      session.info.answers = (session.info.answers || '') + '\nДоп. правки: ' + text;
-      session.state = 'clarifying';
-      await processAndWrite(ctx, session);
-    }
-    return;
-  }
-
-  // Default — treat as new brief
+  // ── По умолчанию — новая задача ──
   await handleBrief(ctx, session, text);
 });
 
@@ -391,7 +415,7 @@ async function handleBrief(ctx, session, text) {
   if (!session.info.section) {
     await ctx.reply(
       '📂 В какой раздел публикуем?',
-      Markup.keyboard([['Кейс', 'Блог', 'FAQ'], ['Новость', 'Отмена']]).oneTime().resize()
+      Markup.keyboard([['Кейс', 'Блог', 'FAQ'], ['Новость', '❌ Отмена']]).oneTime().resize()
     );
     session.state = 'waiting_section';
     return;
@@ -399,20 +423,6 @@ async function handleBrief(ctx, session, text) {
 
   await askClarifyOrWrite(ctx, session);
 }
-
-// ─── KEYBOARD CALLBACKS ──────────────────────────────────────────────────────
-bot.hears(['Кейс', 'Блог', 'FAQ', 'Новость'], async ctx => {
-  const session = getSession(ctx.chat.id);
-  const map = { 'Кейс': SECTIONS['кейс'], 'Блог': SECTIONS['блог'], 'FAQ': SECTIONS['faq'], 'Новость': SECTIONS['новость'] };
-  session.info.section = map[ctx.message.text];
-  await ctx.reply(`✅ Раздел: *${session.info.section.label}*`, { parse_mode:'Markdown', ...Markup.removeKeyboard() });
-  await askClarifyOrWrite(ctx, session);
-});
-
-bot.hears('Отмена', ctx => {
-  resetSession(ctx.chat.id);
-  ctx.reply('Отменено.', Markup.removeKeyboard());
-});
 
 // ─── CLARIFY OR WRITE ────────────────────────────────────────────────────────
 async function askClarifyOrWrite(ctx, session) {
@@ -468,23 +478,6 @@ async function processAndWrite(ctx, session) {
 }
 
 // ─── PUBLISH ─────────────────────────────────────────────────────────────────
-bot.hears('✅ Публикуй', async ctx => {
-  const session = getSession(ctx.chat.id);
-  if (session.state !== 'awaiting_confirm') return;
-  await publishArticle(ctx, session);
-});
-
-bot.hears('✏️ Переделай', async ctx => {
-  const session = getSession(ctx.chat.id);
-  session.state = 'clarifying';
-  ctx.reply('Что переделать? Напиши правки.', Markup.removeKeyboard());
-});
-
-bot.hears('❌ Отмена', ctx => {
-  resetSession(ctx.chat.id);
-  ctx.reply('Отменено. Давай новую задачу.', Markup.removeKeyboard());
-});
-
 async function publishArticle(ctx, session) {
   session.state = 'publishing';
   const article = session.info.article;
