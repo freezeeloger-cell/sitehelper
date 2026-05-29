@@ -1,0 +1,20 @@
+{
+  "name": "crabnorway-bot",
+  "version": "1.0.0",
+  "description": "CrabNorway Telegram Content Agent",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node --watch bot.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "form-data": "^4.0.0",
+    "node-fetch": "^3.3.0",
+    "telegraf": "^4.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
