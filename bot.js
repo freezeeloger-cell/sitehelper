@@ -42,16 +42,22 @@ async function payloadLogin() {
   return data.token;
 }
 
-async function uploadPhotoToPayload(token, photoBuffer, filename) {
+async function uploadPhotoToPayload(token, photoBuffer, filename, alt) {
   const form = new FormData();
   form.append('file', photoBuffer, { filename, contentType: 'image/jpeg' });
+  // Payload reads non-file fields from a JSON string in `_payload` (alt is usually required on Media)
+  form.append('_payload', JSON.stringify({ alt: alt || 'CrabNorway' }));
   const res = await fetch(`${CMS_URL}/api/media`, {
     method: 'POST',
     headers: { Authorization: `JWT ${token}`, ...form.getHeaders() },
     body: form,
   });
-  if (!res.ok) return null;
-  const data = await res.json();
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const fields = (data?.errors?.[0]?.data?.errors || []).map(e => e.field).join(', ');
+    const msg = data?.errors?.[0]?.message || `Media upload failed: ${res.status}`;
+    throw new Error(fields ? `${msg} (поля Media: ${fields})` : msg);
+  }
   return data?.doc?.id || data?.id || null;
 }
 
@@ -513,11 +519,9 @@ async function publishArticle(ctx, session) {
     if (session.photos.length > 0) {
       await ctx.reply('📸 Загружаю фото...').catch(() => {});
       for (let i = 0; i < Math.min(session.photos.length, 3); i++) {
-        try {
-          const buf = await downloadTelegramPhoto(ctx, session.photos[i]);
-          const mediaId = await uploadPhotoToPayload(token, buf, `photo-${Date.now()}-${i}.jpg`);
-          if (mediaId) mediaIds.push(mediaId);
-        } catch {}
+        const buf = await downloadTelegramPhoto(ctx, session.photos[i]);
+        const mediaId = await uploadPhotoToPayload(token, buf, `crab-${Date.now()}-${i}.jpg`, article.h1);
+        if (mediaId) mediaIds.push(mediaId);
       }
     }
 
