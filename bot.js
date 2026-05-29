@@ -55,24 +55,39 @@ async function uploadPhotoToPayload(token, photoBuffer, filename) {
   return data?.doc?.id || data?.id || null;
 }
 
+const CATEGORY_ID = process.env.PAYLOAD_CATEGORY_ID || 4;
+const AUTHOR_ID   = process.env.PAYLOAD_AUTHOR_ID   || 1;
+
 async function createPost(token, article, mediaIds) {
+  // Featured Image is required — must have at least one uploaded photo
+  if (!mediaIds || mediaIds.length === 0) {
+    throw new Error('Нужна обложка: прикрепи хотя бы одно фото к статье и попробуй снова.');
+  }
+
   const body = {
-    title:    article.h1,
-    slug:     article.slug,
-    excerpt:  article.excerpt,
-    content:  toPayloadLexical(article.blocks),
-    _status:  'published',
+    title:         article.h1,
+    slug:          article.slug,
+    excerpt:       article.excerpt,
+    content:       toPayloadLexical(article.blocks),
+    category:      CATEGORY_ID,
+    author:        AUTHOR_ID,
+    featuredImage: mediaIds[0],
+    _status:       'published',
+    publishedAt:   new Date().toISOString(),
     meta: { title: article.metaTitle, description: article.metaDesc },
   };
-  if (article.category) body.category = article.category;
-  if (mediaIds && mediaIds.length > 0) body.heroImage = mediaIds[0];
+
   const res = await fetch(`${CMS_URL}/api/${COLLECTION}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `JWT ${token}` },
     body: JSON.stringify(body),
   });
   const data = await res.json();
-  if (!res.ok) throw new Error(data?.errors?.[0]?.message || `Post create failed: ${res.status}`);
+  if (!res.ok) {
+    const fields = (data?.errors?.[0]?.data?.errors || []).map(e => e.field).join(', ');
+    const msg = data?.errors?.[0]?.message || `Post create failed: ${res.status}`;
+    throw new Error(fields ? `${msg} (поля: ${fields})` : msg);
+  }
   return data?.doc || data;
 }
 
@@ -336,7 +351,11 @@ bot.on('photo', async ctx => {
   session.photos.push(best.file_id);
 
   const caption = ctx.message.caption;
-  if (caption) {
+  if (session.state === 'awaiting_confirm') {
+    // Photo added as cover for a ready article
+    return ctx.reply(`📸 Обложка добавлена. Теперь жми «✅ Публикуй».`,
+      Markup.keyboard([['✅ Публикуй', '✏️ Переделай'], ['❌ Отмена']]).oneTime().resize());
+  } else if (caption) {
     // Photo came with a caption — treat it as a brief
     await handleBrief(ctx, session, caption);
   } else if (session.state === 'idle') {
@@ -465,6 +484,9 @@ async function processAndWrite(ctx, session) {
     }
 
     session.state = 'awaiting_confirm';
+    if (session.photos.length === 0) {
+      await ctx.reply('⚠️ К статье не прикреплено фото, а обложка обязательна. Пришли фото сейчас (одним сообщением), потом жми «Публикуй».');
+    }
     await ctx.reply(formatPreview(article), {
       parse_mode: 'Markdown',
       ...Markup.keyboard([['✅ Публикуй', '✏️ Переделай'], ['❌ Отмена']]).oneTime().resize()
