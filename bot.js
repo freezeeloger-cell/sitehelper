@@ -447,6 +447,8 @@ bot.command('log', ctx => {
   ctx.reply(`📚 *Последние статьи (всего ${memory.log.length}):*\n\n${last}`, { parse_mode:'Markdown' });
 });
 
+bot.command('gaps', ctx => runGapAnalysis(ctx.chat.id));
+
 // ─── PHOTO HANDLER ───────────────────────────────────────────────────────────
 bot.on('photo', async ctx => {
   const session = getSession(ctx.chat.id);
@@ -716,8 +718,6 @@ ${myTopics}
     await bot.telegram.sendMessage(targetChatId, `❌ Не смог собрать идеи: ${e.message}`).catch(() => {});
   }
 }
-
-bot.command('gaps', ctx => runGapAnalysis(ctx.chat.id));
 
 // ─── РАСПИСАНИЕ (без внешних пакетов) ─────────────────────────────────────────
 // Раз в неделю: понедельник 10:00 по Болгарии
