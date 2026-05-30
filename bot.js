@@ -63,6 +63,15 @@ function resetSession(chatId) {
   saveMemory();
 }
 
+// Запоминаем владельца (для авто-сообщений по расписанию)
+bot.use((ctx, next) => {
+  if (ctx.chat && ctx.chat.type === 'private' && memory.ownerChatId !== ctx.chat.id) {
+    memory.ownerChatId = ctx.chat.id;
+    saveMemory();
+  }
+  return next();
+});
+
 // ─── PAYLOAD CMS ─────────────────────────────────────────────────────────────
 const CMS_URL    = process.env.PAYLOAD_URL    || 'https://crabnorway.com';
 const CMS_EMAIL  = process.env.PAYLOAD_EMAIL;
@@ -146,15 +155,43 @@ async function createPost(token, article, mediaIds) {
 }
 
 // ─── PAYLOAD LEXICAL CONVERTER ───────────────────────────────────────────────
+function lexText(text, bold) {
+  return { type:'text', text, format: bold ? 1 : 0, detail:0, mode:'normal', style:'', version:1 };
+}
+function lexLink(label, url) {
+  return {
+    type:'link', version:3, format:'', indent:0, direction:'ltr',
+    fields: { linkType:'custom', newTab:true, url },
+    children: [ lexText(label, false) ],
+  };
+}
+// Превращает [текст](url) → ссылку, **текст** → жирный, остальное — обычный текст
+function parseInline(text) {
+  const nodes = [];
+  const re = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|\*\*([^*]+)\*\*/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) nodes.push(lexText(text.slice(last, m.index), false));
+    if (m[2]) nodes.push(lexLink(m[1], m[2]));      // ссылка
+    else if (m[3]) nodes.push(lexText(m[3], true));  // жирный
+    last = re.lastIndex;
+  }
+  if (last < text.length) nodes.push(lexText(text.slice(last), false));
+  if (nodes.length === 0) nodes.push(lexText(text || '', false));
+  return nodes;
+}
+function stripMarkdown(text) {
+  return (text || '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/\*\*(.+?)\*\*/g, '$1');
+}
 function toPayloadLexical(blocks) {
   const children = (blocks || []).map(b => {
     if (['h1','h2','h3'].includes(b.type)) {
       return { type:'heading', tag:b.type, version:1, format:'', indent:0, direction:'ltr',
-               children:[{ type:'text', text:b.text, format:0, version:1 }] };
+               children:[ lexText(stripMarkdown(b.text), false) ] };
     }
     return { type:'paragraph', version:1, format:'', indent:0, direction:'ltr',
              textFormat:0, textStyle:'',
-             children:[{ type:'text', text:b.text, format:0, version:1 }] };
+             children: parseInline(b.text || '') };
   });
   return { root:{ type:'root', version:1, format:'', indent:0, direction:'ltr', children } };
 }
@@ -235,7 +272,8 @@ const SYSTEM = `Ты — контент-агент Даниила Богатьк
 Ниша: трудоустройство на норвежские краболовные/рыболовные суда.
 Аудитория: русскоязычные 20-40 лет, часто без морского опыта.
 Автор Даниил — 8 судов, 6+ лет в норвежском флоте. Стиль: личный, от первого лица, конкретика и цифры, без воды.
-Разделы сайта: Кейсы (истории реальных людей), Блог (советы/гайды), FAQ, Новости.`;
+Разделы сайта: Кейсы (истории реальных людей), Блог (советы/гайды), FAQ, Новости.
+Ссылки: где уместно, добавляй 1-2 ссылки в формате Markdown [текст](url). Для внутренних ссылок используй https://crabnorway.com (главная), https://crabnorway.com/blog (блог), https://crabnorway.com/contact (контакты). Не выдумывай несуществующие адреса статей.`;
 
 // ─── SLUGIFY ──────────────────────────────────────────────────────────────────
 function slugify(str) {
@@ -383,6 +421,10 @@ bot.start(ctx => {
 4. Напишу статью и опубликую на сайт
 
 *Разделы:* кейс / блог / статья / faq / новость
+
+*Команды:*
+/gaps — идеи статей по конкурентам
+/log — что уже опубликовано
 
 Давай задачу 👇`, { parse_mode: 'Markdown' });
 });
@@ -603,11 +645,110 @@ async function publishArticle(ctx, session) {
   }
 }
 
+// ─── КОНКУРЕНТЫ ──────────────────────────────────────────────────────────────
+const COMPETITORS = (process.env.COMPETITORS || 'https://alexfisherway.com,https://bfisherman.com')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+async function fetchWithTimeout(url, ms = 12000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), ms);
+  try {
+    return await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'Mozilla/5.0 CrabBot' } });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// Собирает темы конкурента: из sitemap.xml, иначе из заголовков главной
+async function fetchCompetitorTopics(baseUrl) {
+  const topics = [];
+  const root = baseUrl.replace(/\/+$/, '');
+  try {
+    const r = await fetchWithTimeout(`${root}/sitemap.xml`);
+    if (r.ok) {
+      const xml = await r.text();
+      const locs = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(m => m[1]);
+      for (const u of locs) {
+        if (/\.(xml|jpg|png|webp|css|js)/i.test(u)) continue;
+        const slug = u.split('/').filter(Boolean).pop();
+        if (slug && slug.length > 3 && !slug.includes('.') && !/^https?$/.test(slug)) topics.push(slug.replace(/[-_]+/g, ' '));
+      }
+    }
+  } catch (e) { /* ignore */ }
+  if (topics.length < 3) {
+    try {
+      const r = await fetchWithTimeout(root);
+      if (r.ok) {
+        const html = await r.text();
+        const titles = [...html.matchAll(/<(?:h1|h2|h3|title)[^>]*>([^<]{8,140})<\/(?:h1|h2|h3|title)>/gi)]
+          .map(m => m[1].replace(/\s+/g, ' ').trim());
+        topics.push(...titles);
+      }
+    } catch (e) { /* ignore */ }
+  }
+  return [...new Set(topics)].slice(0, 40);
+}
+
+async function runGapAnalysis(targetChatId) {
+  await bot.telegram.sendMessage(targetChatId, '🥊 Смотрю конкурентов, собираю идеи...').catch(() => {});
+  let comp = '';
+  for (const url of COMPETITORS) {
+    const t = await fetchCompetitorTopics(url);
+    comp += `\n[${url}] (${t.length} тем):\n${t.join('\n') || '— не удалось прочитать'}\n`;
+  }
+  const myTopics = memory.log.map(a => a.title).join('\n') || '(пока статей нет)';
+  const prompt = `Ты SEO-стратег CrabNorway.com (работа на краболовных и рыболовных судах в Норвегии).
+
+ТЕМЫ КОНКУРЕНТОВ:${comp}
+
+ТЕМЫ, КОТОРЫЕ УЖЕ ЕСТЬ У НАС:
+${myTopics}
+
+Найди 4-5 тем, которые есть/намекаются у конкурентов или логично нужны в нише, но которых у НАС ещё нет. Для каждой: цепляющий заголовок + одна строка почему стоит написать (польза для SEO/аудитории). Кратко, по-русски, без вступлений и воды. Пронумеруй.`;
+  try {
+    const ideas = await callClaude([{ role: 'user', content: prompt }], SYSTEM, false, 1500);
+    await bot.telegram.sendMessage(
+      targetChatId,
+      `💡 *Идеи статей — чего у тебя нет (по конкурентам):*\n\n${ideas}\n\n👉 Понравилась тема? Просто дай мне её обычным способом — напишу и опубликуем.`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => bot.telegram.sendMessage(targetChatId, `💡 Идеи статей:\n\n${ideas}`));
+  } catch (e) {
+    await bot.telegram.sendMessage(targetChatId, `❌ Не смог собрать идеи: ${e.message}`).catch(() => {});
+  }
+}
+
+bot.command('gaps', ctx => runGapAnalysis(ctx.chat.id));
+
+// ─── РАСПИСАНИЕ (без внешних пакетов) ─────────────────────────────────────────
+// Раз в неделю: понедельник 10:00 по Болгарии
+function checkSchedule() {
+  try {
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat('en-US', {
+        timeZone: 'Europe/Sofia', weekday: 'short', hour: '2-digit',
+        hour12: false, year: 'numeric', month: '2-digit', day: '2-digit',
+      }).formatToParts(new Date()).map(p => [p.type, p.value])
+    );
+    const dateStr = `${parts.year}-${parts.month}-${parts.day}`;
+    if (parts.weekday === 'Mon' && parts.hour === '10' && memory.lastGapsDate !== dateStr && memory.ownerChatId) {
+      memory.lastGapsDate = dateStr;
+      saveMemory();
+      console.log('⏰ Запускаю еженедельный анализ конкурентов');
+      runGapAnalysis(memory.ownerChatId).catch(e => console.error('gaps error:', e.message));
+    }
+  } catch (e) {
+    console.error('schedule error:', e.message);
+  }
+}
+
 // ─── LAUNCH ──────────────────────────────────────────────────────────────────
 loadMemory();
 bot.launch()
   .then(() => console.log('✅ CrabNorway Bot запущен'))
   .catch(e => console.error('❌ Ошибка запуска:', e));
+
+setInterval(checkSchedule, 30 * 60 * 1000); // проверка каждые 30 минут
+checkSchedule();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
