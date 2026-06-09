@@ -5,7 +5,7 @@ const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN, { handlerTimeout: 300_000 });
 
 // ─── PERSISTENT MEMORY (диск, переживает перезапуски) ────────────────────────
 const MEMORY_FILE = process.env.MEMORY_FILE || '/data/memory.json';
@@ -136,6 +136,7 @@ async function createPost(token, article, mediaIds) {
     author:        AUTHOR_ID,
     featuredImage: mediaIds[0],
     _status:       'published',
+    status:        'published',
     publishedAt:   new Date().toISOString(),
     meta: { title: article.metaTitle, description: article.metaDesc },
   };
@@ -742,6 +743,11 @@ function checkSchedule() {
 }
 
 // ─── LAUNCH ──────────────────────────────────────────────────────────────────
+bot.catch((err, ctx) => {
+  console.error('⚠️ Ошибка обработки:', err?.message || err);
+  try { ctx.reply('⚠️ Что-то пошло не так при обработке. Попробуй ещё раз или напиши /start.'); } catch (_) {}
+});
+
 loadMemory();
 bot.launch()
   .then(() => console.log('✅ CrabNorway Bot запущен'))
