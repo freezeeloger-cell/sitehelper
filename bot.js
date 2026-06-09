@@ -353,21 +353,23 @@ ${context}
   ]
 }
 Минимум 12 блоков. Стиль Даниила — личный опыт, цифры, без воды.
-ОБЯЗАТЕЛЬНО: последние 1-2 блока — живой подвод к сообществу АМОРЕ со ссылкой [АМОРЕ](${AMORE_LINK}).`
+ОБЯЗАТЕЛЬНО заверши статью заметным призывом к АМОРЕ ТРЕМЯ отдельными блоками:
+1) {"type":"h2","text":"яркий вопрос-зацепка, напр. 🦀 Готов попасть на норвежское судно?"}
+2) {"type":"p","text":"1-2 предложения по-человечески про сообщество АМОРЕ и чем помогает"}
+3) {"type":"p","text":"👉 [ВСТУПИТЬ В АМОРЕ](${AMORE_LINK})"}  ← ссылка отдельной строкой, заметно`
   }], SYSTEM);
 
   const article = parseArticleJson(articleRaw);
   article.category = info.section?.category || 'blog';
   if (!article.slug) article.slug = slugify(article.h1);
 
-  // Страховка: если модель не вставила ссылку на АМОРЕ — добавляем блок сами
+  // Страховка: если модель не вставила ссылку на АМОРЕ — добавляем заметный блок сами
   const hasAmore = JSON.stringify(article.blocks || []).includes('Crabnorwaybot/amore');
   if (!hasAmore) {
     article.blocks = article.blocks || [];
-    article.blocks.push({
-      type: 'p',
-      text: `Хочешь пройти этот путь не в одиночку, а с теми, кто уже работает на норвежских судах? Загляни в наше сообщество моряков — [АМОРЕ](${AMORE_LINK}). Там менторы помогают с документами, резюме и реальными вакансиями.`,
-    });
+    article.blocks.push({ type: 'h2', text: '🦀 Готов попасть на норвежское судно?' });
+    article.blocks.push({ type: 'p', text: 'Не иди этот путь в одиночку. В сообществе АМОРЕ менторы помогают с документами, резюме и реальными вакансиями на норвежских судах.' });
+    article.blocks.push({ type: 'p', text: `👉 [ВСТУПИТЬ В АМОРЕ](${AMORE_LINK})` });
   }
   return article;
 }
@@ -448,6 +450,7 @@ bot.start(ctx => {
 
 *Команды:*
 /gaps — идеи статей по конкурентам
+/youtube — разобрать новые видео с твоего канала
 /log — что уже опубликовано
 
 Давай задачу 👇`, { parse_mode: 'Markdown' });
@@ -472,6 +475,7 @@ bot.command('log', ctx => {
 });
 
 bot.command('gaps', ctx => runGapAnalysis(ctx.chat.id));
+bot.command('youtube', ctx => runYoutubeScan(ctx.chat.id));
 
 // ─── PHOTO HANDLER ───────────────────────────────────────────────────────────
 bot.on('photo', async ctx => {
@@ -743,8 +747,99 @@ ${myTopics}
   }
 }
 
+// ─── YOUTUBE (авто-слежка за каналом) ────────────────────────────────────────
+const YT_CHANNEL = process.env.YT_CHANNEL || 'https://www.youtube.com/@Crabnorway';
+
+function decodeXml(s) {
+  return (s || '').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+    .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&#(\d+);/g,(_,n)=>String.fromCharCode(n));
+}
+
+async function resolveChannelId() {
+  if (memory.ytChannelId) return memory.ytChannelId;
+  const r = await fetchWithTimeout(YT_CHANNEL);
+  const html = await r.text();
+  const m = html.match(/"(?:channelId|externalId)":"(UC[\w-]+)"/) || html.match(/channel\/(UC[\w-]+)/);
+  if (!m) throw new Error('не смог определить ID канала');
+  memory.ytChannelId = m[1];
+  saveMemory();
+  return m[1];
+}
+
+async function fetchChannelVideos() {
+  const id = await resolveChannelId();
+  const r = await fetchWithTimeout(`https://www.youtube.com/feeds/videos.xml?channel_id=${id}`);
+  const xml = await r.text();
+  return [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map(e => {
+    const b = e[1];
+    return {
+      vid: (b.match(/<yt:videoId>([^<]+)<\/yt:videoId>/) || [])[1],
+      title: decodeXml((b.match(/<title>([^<]+)<\/title>/) || [])[1]),
+      desc: decodeXml((b.match(/<media:description>([\s\S]*?)<\/media:description>/) || [])[1]),
+    };
+  }).filter(v => v.vid);
+}
+
+// Лучшая попытка достать субтитры (может не сработать — YouTube иногда закрывает)
+async function fetchTranscript(videoId) {
+  try {
+    const r = await fetchWithTimeout(`https://www.youtube.com/watch?v=${videoId}`);
+    const html = await r.text();
+    const m = html.match(/"captionTracks":(\[.*?\])/);
+    if (!m) return '';
+    const tracks = JSON.parse(m[1].replace(/\\u0026/g, '&'));
+    const track = tracks.find(t => /ru/i.test(t.languageCode)) || tracks[0];
+    if (!track?.baseUrl) return '';
+    const tr = await fetchWithTimeout(track.baseUrl.replace(/\\u0026/g, '&'));
+    const txt = await tr.text();
+    const texts = [...txt.matchAll(/<text[^>]*>([\s\S]*?)<\/text>/g)].map(x => decodeXml(x[1].replace(/<[^>]+>/g, '')));
+    return texts.join(' ').slice(0, 6000);
+  } catch (e) {
+    return '';
+  }
+}
+
+async function runYoutubeScan(targetChatId, limit = 6) {
+  await bot.telegram.sendMessage(targetChatId, '📺 Смотрю твой YouTube, разбираю видео...').catch(() => {});
+  let videos;
+  try {
+    videos = await fetchChannelVideos();
+  } catch (e) {
+    return bot.telegram.sendMessage(targetChatId, `❌ Не смог прочитать канал: ${e.message}`).catch(() => {});
+  }
+  memory.seenVideos = memory.seenVideos || [];
+  const fresh = videos.filter(v => !memory.seenVideos.includes(v.vid)).slice(0, limit);
+  if (fresh.length === 0) {
+    return bot.telegram.sendMessage(targetChatId, '📺 Новых видео нет — все недавние уже разобрал.').catch(() => {});
+  }
+  for (const v of fresh) {
+    const transcript = await fetchTranscript(v.vid);
+    const basis = transcript
+      ? `Расшифровка видео (фрагмент): ${transcript}`
+      : `Субтитры недоступны. Название: ${v.title}\nОписание: ${(v.desc || '').slice(0, 600)}`;
+    const prompt = `Это видео Даниила на YouTube-канале CrabNorway.
+Название: ${v.title}
+${basis}
+
+На основе этого видео предложи 2-3 идеи SEO-статей для блога CrabNorway.com: чтобы продвигали сайт в Google и вели читателя к сообществу АМОРЕ. Для каждой идеи — цепляющий заголовок + одна строка сути. Кратко, по-русски, без воды.`;
+    try {
+      const ideas = await callClaude([{ role: 'user', content: prompt }], SYSTEM, false, 1200);
+      const tag = transcript ? '(разобрал по субтитрам)' : '(по названию и описанию — субтитров нет)';
+      await bot.telegram.sendMessage(targetChatId,
+        `🎬 *${v.title}*\n${tag}\n\n${ideas}\n\nhttps://youtu.be/${v.vid}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => bot.telegram.sendMessage(targetChatId, `🎬 ${v.title}\n\n${ideas}\nhttps://youtu.be/${v.vid}`));
+    } catch (e) { /* пропускаем видео при сбое */ }
+    memory.seenVideos.push(v.vid);
+    saveMemory();
+    await sleep(600);
+  }
+  if (memory.seenVideos.length > 1000) memory.seenVideos = memory.seenVideos.slice(-1000);
+  await bot.telegram.sendMessage(targetChatId, `✅ Разобрал ${fresh.length} видео. Понравилась идея — просто дай мне тему, напишу статью.`).catch(() => {});
+}
+
 // ─── РАСПИСАНИЕ (без внешних пакетов) ─────────────────────────────────────────
-// Раз в неделю: понедельник 10:00 по Болгарии
+// Понедельник 10:00 — конкуренты; каждый день 09:00 — YouTube (по Болгарии)
 function checkSchedule() {
   try {
     const parts = Object.fromEntries(
@@ -759,6 +854,12 @@ function checkSchedule() {
       saveMemory();
       console.log('⏰ Запускаю еженедельный анализ конкурентов');
       runGapAnalysis(memory.ownerChatId).catch(e => console.error('gaps error:', e.message));
+    }
+    if (parts.hour === '09' && memory.lastYtDate !== dateStr && memory.ownerChatId) {
+      memory.lastYtDate = dateStr;
+      saveMemory();
+      console.log('⏰ Запускаю ежедневный разбор YouTube');
+      runYoutubeScan(memory.ownerChatId).catch(e => console.error('youtube error:', e.message));
     }
   } catch (e) {
     console.error('schedule error:', e.message);
